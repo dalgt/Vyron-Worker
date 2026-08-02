@@ -63,10 +63,10 @@ function jsonResponse(obj, status = 200) {
 	});
 }
 
-function htmlResponse(html, status = 200) {
+function htmlResponse(html, status = 200, extraHeaders = {}) {
 	return new Response(html, {
 		status,
-		headers: { "Content-Type": "text/html; charset=utf-8" },
+		headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", ...extraHeaders },
 	});
 }
 
@@ -446,8 +446,43 @@ async function handleInteractions(request, env) {
 	return jsonResponse({ type: 4, data: { content: "Unknown command." } });
 }
 
-// ---- GET /claim?token=... - tiap tahap gateway sfl.gl mendarat di sini ----
+// ---- GET /claim?token=... - HALAMAN LANDING tiap tahap gateway sfl.gl mendarat
+// ----           di sini. SENGAJA TIDAK menghapus token di sini, karena banyak
+// ----           layanan shortener (sfl.gl dkk) suka nge-fetch URL tujuan
+// ----           duluan di server mereka (buat scrape title/preview/cek link
+// ----           hidup) SEBELUM user beneran klik tombol lanjut. Kalau token
+// ----           langsung dihapus di GET ini, fetch otomatis itu yang bakal
+// ----           "makan" token duluan -> user asli kena "link expired" padahal
+// ----           belum pernah klik apa-apa.
 async function handleClaim(url, env) {
+	const token = url.searchParams.get("token");
+	if (!token) {
+		return htmlResponse("<h2>Link gak valid.</h2><p>Coba jalankan /getkey lagi di Discord.</p>", 400);
+	}
+
+	const raw = await env.LICENSES.get(`claim:${token}`);
+	if (!raw) {
+		return htmlResponse("<h2>Link sudah expired atau sudah pernah dipakai.</h2><p>Coba jalankan /getkey lagi di Discord buat dapat link baru dari awal.</p>", 400);
+	}
+
+	const claimData = JSON.parse(raw);
+	const { totalSteps, stepDone } = claimData;
+
+	return htmlResponse(`
+		<html><body style="font-family:sans-serif;text-align:center;padding:40px;">
+			<h2>Tahap ${stepDone + 1} dari ${totalSteps}</h2>
+			<p>Klik tombol di bawah buat lanjut proses ambil key kamu.</p>
+			<p><a href="/claim/confirm?token=${token}" style="font-size:18px;">✅ Lanjutkan</a></p>
+			<p style="color:#888;font-size:13px;">Link ini berlaku 15 menit. Kalau expired, jalankan /getkey lagi dari awal.</p>
+		</body></html>
+	`);
+}
+
+// ---- GET /claim/confirm?token=... - INI baru bener-bener KONSUMSI token.
+// ----           Cuma kesentuh kalau user beneran klik tombol "Lanjutkan" di
+// ----           halaman /claim di atas, jadi aman dari fetch otomatis bot/
+// ----           shortener yang cuma nge-scrape halaman /claim doang. ----
+async function handleClaimConfirm(url, env) {
 	const token = url.searchParams.get("token");
 	if (!token) {
 		return htmlResponse("<h2>Link gak valid.</h2><p>Coba jalankan /getkey lagi di Discord.</p>", 400);
@@ -632,6 +667,10 @@ export default {
 
 		if (url.pathname === "/claim") {
 			return handleClaim(url, env);
+		}
+
+		if (url.pathname === "/claim/confirm") {
+			return handleClaimConfirm(url, env);
 		}
 
 		if (url.pathname === "/register" || url.pathname === "/setup") {
