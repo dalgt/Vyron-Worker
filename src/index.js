@@ -13,6 +13,12 @@
 //   APPLICATION_ID       -> dari Discord Developer Portal
 //   BOT_TOKEN            -> dari Discord Developer Portal (centang Encrypt)
 //   SETUP_SECRET         -> Vyronkey22 (dipakai buat lock link daftar command)
+//   GETKEY_CHANNEL_ID    -> ID channel Discord (mis. #get-key) tempat progress
+//                             tiap tahap /getkey di-post (bukan DM lagi).
+//                             Cara ambil: Discord Settings -> Advanced -> aktifin
+//                             Developer Mode, terus klik kanan channel -> Copy
+//                             Channel ID. Bot HARUS punya akses "Send Messages"
+//                             di channel itu.
 //   SFL_API_KEY           -> API Token dari safelinku.com (Member > Tools > Api),
 //                             dipakai buat nge-shrink tiap link gateway /getkey.
 //                             Kalau kosong/API gagal, link mentah (gak di-shrink)
@@ -68,6 +74,34 @@ function htmlResponse(html, status = 200, extraHeaders = {}) {
 		status,
 		headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", ...extraHeaders },
 	});
+}
+
+// Halaman transisi: coba buka app Discord otomatis (lewat custom URI scheme
+// discord://), fallback ke versi web kalau app-nya gak ke-detect / di-block
+// sama in-app browser (WebView shortener kadang nge-block custom scheme).
+// fallbackHtml tetap ditampilin buat jaga-jaga kalau auto-redirect gagal.
+function discordRedirectHtml(heading, fallbackHtml) {
+	return htmlResponse(`
+		<html>
+		<head>
+			<meta http-equiv="refresh" content="2;url=https://discord.com/channels/@me">
+			<script>
+				setTimeout(function () {
+					try { window.location.href = "discord://-/channels/@me"; } catch (e) {}
+				}, 200);
+				setTimeout(function () {
+					window.location.href = "https://discord.com/channels/@me";
+				}, 1200);
+			</script>
+		</head>
+		<body style="font-family:sans-serif;text-align:center;padding:40px;">
+			<h2>${heading}</h2>
+			${fallbackHtml}
+			<p style="margin-top:24px;"><a href="https://discord.com/channels/@me" style="font-size:18px;">↩ Buka Discord manual</a></p>
+			<p style="color:#888;font-size:13px;">Kalau gak otomatis kebuka, pencet link di atas atau balik manual ke app Discord.</p>
+		</body>
+		</html>
+	`);
 }
 
 function hexToBytes(hex) {
@@ -245,6 +279,26 @@ async function sendDM(discordId, content, env) {
 		if (!dmChannel.id) return false;
 
 		const msgRes = await fetch(`https://discord.com/api/v10/channels/${dmChannel.id}/messages`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bot ${env.BOT_TOKEN}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ content }),
+		});
+		return msgRes.ok;
+	} catch (e) {
+		return false;
+	}
+}
+
+// Kirim pesan ke channel biasa (bukan DM) - dipakai buat progress /getkey
+// tiap tahap, biar user langsung liat di #get-key. Content ditandain
+// <@discordId> di awal biar user ke-ping/notif.
+async function sendChannelMessage(channelId, content, env) {
+	if (!channelId) return false;
+	try {
+		const msgRes = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
 			method: "POST",
 			headers: {
 				Authorization: `Bot ${env.BOT_TOKEN}`,
@@ -513,14 +567,17 @@ async function handleClaimConfirm(url, env) {
 		const nextClaimUrl = `${origin}/claim?token=${nextToken}`;
 		const nextLink = await shrinkWithSfl(nextClaimUrl, env);
 
-		return htmlResponse(`
-			<html><body style="font-family:sans-serif;text-align:center;padding:40px;">
-				<h2>Tahap ${nextStepDone} dari ${totalSteps} selesai ✅</h2>
-				<p>Lanjut ke tahap ${nextStepDone + 1} buat lanjutin proses ambil key ${TIER_LABELS[tier]} kamu.</p>
-				<p><a href="${nextLink}" style="font-size:18px;">➡ Lanjut ke tahap ${nextStepDone + 1}</a></p>
-				<p style="color:#888;font-size:13px;">Link ini berlaku 15 menit. Kalau expired, jalankan /getkey lagi dari awal.</p>
-			</body></html>
-		`);
+		const channelContent =
+			`<@${discordId}> ✅ Tahap ${nextStepDone} dari ${totalSteps} selesai!\n\n` +
+			`Progress: ${buildProgressBar(nextStepDone + 1, totalSteps)}\n\n` +
+			`Lanjut ke tahap ${nextStepDone + 1} buat key **${TIER_LABELS[tier]}** kamu (link ini berlaku 15 menit):\n${nextLink}`;
+		const posted = await sendChannelMessage(env.GETKEY_CHANNEL_ID, channelContent, env);
+
+		const fallbackHtml = posted
+			? `<p>Progress: ${buildProgressBar(nextStepDone + 1, totalSteps)}</p><p>Link tahap ${nextStepDone + 1} sudah di-post di channel get-key.</p>`
+			: `<p>Gagal kirim pesan ke channel (cek GETKEY_CHANNEL_ID / izin bot). Klik link ini buat lanjut manual:</p><p><a href="${nextLink}" style="font-size:18px;">➡ Lanjut ke tahap ${nextStepDone + 1}</a></p>`;
+
+		return discordRedirectHtml(`Tahap ${nextStepDone} dari ${totalSteps} selesai ✅`, fallbackHtml);
 	}
 
 	// Tahap terakhir -> jaga-jaga race condition, aktifkan license, kirim DM
@@ -532,24 +589,19 @@ async function handleClaimConfirm(url, env) {
 	const expiresAt = await activateLicense(discordId, tier, env);
 	await env.LICENSES.put(`getkey_used:${discordId}`, "1"); // one-time flag, permanen, gak ada TTL
 
-	const dmContent =
-		`✅ License kamu aktif! Tier: **${TIER_LABELS[tier]}**, ${expiryText(expiresAt)}.\n` +
+	const channelContent =
+		`<@${discordId}> ✅ License kamu aktif! Tier: **${TIER_LABELS[tier]}**, ${expiryText(expiresAt)}.\n` +
 		`Buka modul script Vyron SB, pencet **Recheck License** kalau belum otomatis kebuka.\n\n` +
 		`Ingat: /getkey cuma bisa dipakai 1x seumur hidup. Kalau key ini nanti expired, hubungi Owner buat beli **Permanent**.`;
-	const dmSent = await sendDM(discordId, dmContent, env);
+	const posted = await sendChannelMessage(env.GETKEY_CHANNEL_ID, channelContent, env);
 
-	const dmNote = dmSent
-		? "Key sudah dikirim juga lewat DM Discord kamu."
-		: "Gagal kirim DM (mungkin DM kamu ditutup) - tapi license-nya sudah aktif kok, tinggal pencet Recheck License di script.";
+	const channelNote = posted
+		? "Konfirmasi juga udah di-post di channel get-key."
+		: "Gagal post ke channel (cek GETKEY_CHANNEL_ID / izin bot) - tapi license-nya sudah aktif kok, tinggal pencet Recheck License di script.";
 
-	return htmlResponse(`
-		<html><body style="font-family:sans-serif;text-align:center;padding:40px;">
-			<h2>✅ Semua ${totalSteps} tahap selesai, key berhasil diaktifkan!</h2>
-			<p>Tier: <b>${TIER_LABELS[tier]}</b></p>
-			<p>${dmNote}</p>
-			<p>Balik ke Discord / game, buka modul script, pencet <b>Recheck License</b>.</p>
-		</body></html>
-	`);
+	const fallbackHtml = `<p>Tier: <b>${TIER_LABELS[tier]}</b></p><p>${channelNote}</p><p>Buka modul script, pencet <b>Recheck License</b>.</p>`;
+
+	return discordRedirectHtml(`✅ Semua ${totalSteps} tahap selesai, key berhasil diaktifkan!`, fallbackHtml);
 }
 
 async function handleVerifyLicense(url, env) {
